@@ -14,7 +14,7 @@ import {
   Camera
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { analyzeMaterial } from './lib/gemini';
+import { analyzeMaterial } from './ai/gemini';
 import { getFileNameWithoutExtension, cleanExtractedText } from './lib/pdfUtils';
 import { Question, StudySession, Stats } from './types';
 import { clsx, type ClassValue } from 'clsx';
@@ -256,7 +256,7 @@ export default function App() {
   );
 
   return (
-    <div className="flex h-screen bg-slate-50 text-slate-900 font-sans overflow-hidden selection:bg-blue-100">
+    <div className="flex h-[100dvh] bg-slate-50 text-slate-900 font-sans overflow-hidden selection:bg-blue-100">
       {/* Desktop Sidebar */}
       <nav className="hidden md:flex w-64 bg-slate-900 flex-col border-r border-slate-700 shrink-0">
         <NavContent />
