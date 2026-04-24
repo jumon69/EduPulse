@@ -11,7 +11,8 @@ import {
   Loader2,
   Trash2,
   BrainCircuit,
-  Camera
+  Camera,
+  Search
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { analyzeMaterial } from './ai/gemini';
@@ -26,6 +27,7 @@ function cn(...inputs: ClassValue[]) {
 
 export default function App() {
   const [sessions, setSessions] = useState<StudySession[]>([]);
+  const [showSplash, setShowSplash] = useState(true);
   const [activeSession, setActiveSession] = useState<StudySession | null>(null);
   const [stats, setStats] = useState<Stats>({ total_attempts: 0, correct_answers: 0 });
   const [isUploading, setIsUploading] = useState(false);
@@ -37,6 +39,7 @@ export default function App() {
   const [userAvatar, setUserAvatar] = useState(() => localStorage.getItem('hsc_user_avatar') || '');
   const [userApiKey, setUserApiKey] = useState(() => localStorage.getItem('hsc_gemini_api_key') || '');
   const [joke, setJoke] = useState('');
+  const [searchHistory, setSearchHistory] = useState("");
 
   const jokes = [
     "ডাক্তার: আপনার দাঁত তো সব ঠিকই আছে, তাহলে ব্যথা কেন?\nরোগী: দাঁতগুলো ঠিক ঠিক জায়গায় নেই ডাক্তার সাহেব, একটা তো আমার পকেটে!",
@@ -55,22 +58,38 @@ export default function App() {
     }
   }, [isUploading]);
 
+  async function fetchSessions() {
+    try {
+      const res = await fetch('/api/sessions');
+      if (!res.ok) throw new Error('Failed to fetch sessions');
+      const data = await res.json();
+      setSessions(data);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  async function fetchStats() {
+    try {
+      const res = await fetch('/api/stats');
+      if (!res.ok) throw new Error('Failed to fetch stats');
+      const data = await res.json();
+      setStats(data);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
   useEffect(() => {
     fetchSessions();
     fetchStats();
+    
+    // Splash screen timeout
+    const timer = setTimeout(() => {
+      setShowSplash(false);
+    }, 3500);
+    return () => clearTimeout(timer);
   }, []);
-
-  const fetchSessions = async () => {
-    const res = await fetch('/api/sessions');
-    const data = await res.json();
-    setSessions(data);
-  };
-
-  const fetchStats = async () => {
-    const res = await fetch('/api/stats');
-    const data = await res.json();
-    setStats(data);
-  };
 
   const takePhoto = async () => {
     const input = document.createElement('input');
@@ -90,6 +109,12 @@ export default function App() {
   };
 
   const handleFileUploadInternal = async (file: File) => {
+    // Mobile optimization: Limit file size to 5MB
+    if (file.size > 5 * 1024 * 1024) {
+      alert("ফাইলটি অত্যন্ত বড় (৫ এমবি এর বেশি)। মোবাইল স্টাবিলিটির জন্য ৫ এমবি এর কম সাইজের ফাইল ব্যবহার করুন।");
+      return;
+    }
+
     const existingSession = sessions.find(s => s.name === getFileNameWithoutExtension(file.name));
     if (existingSession) {
       if (confirm(`"${existingSession.name}" এর জন্য পূর্ববর্তী অনুশীলন সেশন পাওয়া গেছে। আপনি কি সেটি লোড করতে চান?`)) {
@@ -99,14 +124,14 @@ export default function App() {
     }
 
     setIsUploading(true);
-    setUploadProgress("0");
+    setUploadProgress("0% - ফাইল আপলোড হচ্ছে...");
 
     try {
       // 1. Extract text from file via backend
       const formData = new FormData();
       formData.append('file', file);
 
-      setUploadProgress("এটি কিছুক্ষণ সময় নিতে পারে (Extracting text)...");
+      setUploadProgress("10% - লেখা বের করা হচ্ছে (এটি কিছুক্ষণ সময় নিতে পারে)...");
       const extractRes = await fetch('/api/extract-text', {
         method: 'POST',
         body: formData
@@ -117,16 +142,17 @@ export default function App() {
         throw new Error(errorData.error || "Failed to extract text");
       }
 
+      setUploadProgress("40% - লেখা প্রসেস করা হচ্ছে...");
       const { content } = await extractRes.json();
       
       if (!content) throw new Error("No content extracted from file");
 
       const cleanedContent = cleanExtractedText(content);
       
-      // Chunking for large files - slightly larger chunks to balance detail and performance
-      const chunkSize = 7000;
+      // Chunking for large files - cap at 4 chunks for mobile memory stability
+      const chunkSize = 8000;
       const chunks = [];
-      for (let i = 0; i < cleanedContent.length; i += chunkSize) {
+      for (let i = 0; i < cleanedContent.length && chunks.length < 4; i += chunkSize) {
         chunks.push(cleanedContent.substring(i, i + chunkSize));
       }
 
@@ -135,8 +161,9 @@ export default function App() {
       const sessionId = Math.random().toString(36).substring(7);
 
       for (let i = 0; i < chunks.length; i++) {
-        const percent = Math.round(((i + 1) / chunks.length) * 100);
-        setUploadProgress(`${percent}`);
+        // Map processing stage (40% to 90%)
+        const chunkProgress = Math.round(40 + ((i / chunks.length) * 50));
+        setUploadProgress(`${chunkProgress}% - AI দিয়ে বিশ্লেষণ করা হচ্ছে (অংশ ${i + 1}/${chunks.length})...`);
         
         // 2. Process content with Gemini library
         const { summary, questions } = await analyzeMaterial(chunks[i]);
@@ -149,12 +176,9 @@ export default function App() {
         
         allQuestions = [...allQuestions, ...processedQuestions];
         finalSummary += (summary || "") + "\n";
-
-        // Small delay to prevent blocking the main thread too long and help garbage collection
-        if (chunks.length > 5) {
-          await new Promise(resolve => setTimeout(resolve, 50));
-        }
       }
+
+      setUploadProgress("95% - প্রশ্নগুলো সেভ করা হচ্ছে...");
 
       const sessionData: StudySession = {
         id: sessionId,
@@ -181,6 +205,16 @@ export default function App() {
     } finally {
       setIsUploading(false);
       setUploadProgress("");
+    }
+  };
+
+  const deleteSession = async (id: string) => {
+    if (!confirm("আপনি কি নিশ্চিতভাবে এই সেশনটি মুছে ফেলতে চান?")) return;
+    try {
+      await fetch(`/api/session/${id}`, { method: 'DELETE' });
+      setSessions(sessions.filter(s => s.id !== id));
+    } catch (err) {
+      console.error(err);
     }
   };
 
@@ -261,7 +295,129 @@ export default function App() {
   );
 
   return (
-    <div className="flex h-[100dvh] bg-slate-50 text-slate-900 font-sans overflow-hidden selection:bg-blue-100">
+    <div className="min-h-screen bg-slate-100 font-sans selection:bg-blue-100 selection:text-blue-700">
+      <AnimatePresence>
+        {showSplash && (
+          <motion.div 
+            initial={{ opacity: 1 }}
+            exit={{ opacity: 0, scale: 1.1, filter: "blur(10px)" }}
+            transition={{ duration: 1, ease: [0.43, 0.13, 0.23, 0.96] }}
+            className="fixed inset-0 z-[100] bg-[#0f172a] flex flex-col items-center justify-center overflow-hidden"
+          >
+            {/* Animated stars/particles background */}
+            <div className="absolute inset-0 overflow-hidden pointer-events-none">
+              {[...Array(20)].map((_, i) => (
+                <motion.div
+                  key={i}
+                  initial={{ 
+                    x: Math.random() * 100 + "%", 
+                    y: Math.random() * 100 + "%",
+                    opacity: 0,
+                    scale: 0
+                  }}
+                  animate={{ 
+                    opacity: [0, 0.5, 0],
+                    scale: [0, 1, 0],
+                    y: ["-10%", "110%"]
+                  }}
+                  transition={{ 
+                    duration: Math.random() * 5 + 5, 
+                    repeat: Infinity,
+                    delay: Math.random() * i
+                  }}
+                  className="absolute w-1 h-1 bg-blue-400 rounded-full blur-[1px]"
+                />
+              ))}
+            </div>
+
+            <motion.div 
+              animate={{ 
+                scale: [1, 1.1, 1],
+                opacity: [0.15, 0.3, 0.15]
+              }}
+              transition={{ duration: 6, repeat: Infinity, ease: "easeInOut" }}
+              className="absolute inset-0 bg-blue-600/20 blur-[120px] rounded-full" 
+            />
+            
+            <div className="relative flex flex-col items-center">
+              {/* Animated Logo Icon with glow */}
+              <motion.div
+                initial={{ scale: 0, rotate: -45, y: 50 }}
+                animate={{ scale: 1, rotate: 0, y: 0 }}
+                transition={{ 
+                  type: "spring", 
+                  damping: 15, 
+                  stiffness: 100, 
+                  delay: 0.2 
+                }}
+                className="relative mb-10"
+              >
+                <div className="absolute inset-0 bg-blue-500 blur-2xl opacity-40 animate-pulse" />
+                <div className="relative w-28 h-28 bg-gradient-to-br from-blue-400 via-blue-600 to-indigo-700 rounded-[2rem] flex items-center justify-center shadow-2xl shadow-blue-900/50">
+                  <BrainCircuit className="w-14 h-14 text-white" />
+                </div>
+              </motion.div>
+
+              {/* Title with staggered reveal */}
+              <div className="text-center overflow-hidden">
+                <motion.h1
+                  initial={{ opacity: 0, y: 30 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.8, delay: 0.8, ease: "easeOut" }}
+                  className="text-5xl md:text-7xl font-black bg-clip-text text-transparent bg-gradient-to-b from-white via-white to-slate-500 mb-4 tracking-tighter"
+                >
+                  HSC MCQ Genie
+                </motion.h1>
+                
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 1, delay: 1.2 }}
+                  className="flex items-center justify-center gap-4"
+                >
+                  <div className="h-[1px] w-8 bg-gradient-to-r from-transparent to-blue-500" />
+                  <p className="text-blue-400 text-xs md:text-sm font-bold tracking-[0.5em] uppercase">
+                    Ultimate Learning AI
+                  </p>
+                  <div className="h-[1px] w-8 bg-gradient-to-l from-transparent to-blue-500" />
+                </motion.div>
+              </div>
+
+              {/* Loading Indicator */}
+              <div className="mt-12 h-1 w-64 bg-slate-800 rounded-full overflow-hidden border border-slate-700/30">
+                <motion.div 
+                  initial={{ x: "-100%" }}
+                  animate={{ x: "0%" }}
+                  transition={{ duration: 2.8, ease: "linear", delay: 0.5 }}
+                  className="h-full w-full bg-gradient-to-r from-blue-600 to-indigo-400"
+                />
+              </div>
+            </div>
+
+            {/* Credits - FROM Akhtar Ujjaman - Positioned with more elegance */}
+            <motion.div 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 1.8, duration: 1 }}
+              className="absolute bottom-16 flex flex-col items-center"
+            >
+              <div className="flex items-center gap-4 mb-3">
+                <div className="h-px w-6 bg-slate-700" />
+                <span className="text-slate-500 text-[10px] font-black tracking-[0.4em] uppercase">Built with magic</span>
+                <div className="h-px w-6 bg-slate-700" />
+              </div>
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-slate-600 text-[9px] font-bold uppercase tracking-widest">FROM</span>
+                <h2 className="text-2xl font-black text-white tracking-widest bg-clip-text text-transparent bg-gradient-to-r from-blue-300 via-white to-indigo-300">
+                  AKHTAR UJJAMAN
+                </h2>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <div className="flex h-[100dvh] bg-slate-50 text-slate-900 font-sans overflow-hidden selection:bg-blue-100">
       {/* Desktop Sidebar */}
       <nav className="hidden md:flex w-64 bg-slate-900 flex-col border-r border-slate-700 shrink-0">
         <NavContent />
@@ -347,14 +503,14 @@ export default function App() {
                 
                 <div className="space-y-2">
                     <h2 className="text-3xl font-black text-slate-900 tracking-tight">ম্যাজিক চলছে...</h2>
-                    <p className="text-slate-500 font-bold">{parseInt(uploadProgress) ? `প্রসেসিং হচ্ছে: ${uploadProgress}%` : uploadProgress}</p>
+                    <p className="text-slate-500 font-bold">{uploadProgress}</p>
                 </div>
 
                 {parseInt(uploadProgress) > 0 && (
                   <div className="w-full bg-slate-100 h-4 rounded-full overflow-hidden border border-slate-200">
                       <motion.div 
                         initial={{ width: 0 }}
-                        animate={{ width: `${uploadProgress}%` }}
+                        animate={{ width: `${parseInt(uploadProgress)}%` }}
                         className="h-full bg-blue-600"
                       />
                   </div>
@@ -501,51 +657,103 @@ export default function App() {
               {view === 'history' && (
                  <motion.div 
                    key="history"
-                   initial={{ opacity: 0 }}
-                   animate={{ opacity: 1 }}
-                   exit={{ opacity: 0 }}
-                   className="space-y-6 md:space-y-8"
+                   initial={{ opacity: 0, y: 10 }}
+                   animate={{ opacity: 1, y: 0 }}
+                   exit={{ opacity: 0, y: -10 }}
+                   className="space-y-8"
                  >
-                   <div className="flex items-center gap-3 md:gap-4">
-                     <button onClick={() => setView('dashboard')} className="w-8 h-8 md:w-10 md:h-10 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg md:rounded-xl flex items-center justify-center transition-all shadow-sm">
-                       <ChevronLeft className="w-5 h-5 md:w-6 md:h-6" />
-                     </button>
-                     <h1 className="text-2xl md:text-3xl font-black tracking-tight text-slate-900">Study History</h1>
+                   <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+                     <div className="flex items-center gap-4">
+                       <button onClick={() => setView('dashboard')} className="w-10 h-10 bg-white hover:bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-center transition-all shadow-sm active:scale-95">
+                         <ChevronLeft className="w-6 h-6" />
+                       </button>
+                       <div>
+                        <h1 className="text-3xl font-black tracking-tight text-slate-900 leading-none">অধ্যয়নের ইতিহাস</h1>
+                        <p className="text-slate-500 font-medium text-sm mt-1">আপনার সকল পূর্ববর্তী স্টাডি সেশন</p>
+                       </div>
+                     </div>
+                     
+                     <div className="relative max-w-md w-full">
+                       <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 pointer-events-none" />
+                       <input 
+                         type="text"
+                         placeholder="সেশন খুঁজুন..."
+                         value={searchHistory}
+                         onChange={(e) => setSearchHistory(e.target.value)}
+                         className="w-full bg-white border border-slate-200 py-3 pl-12 pr-4 rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-900"
+                       />
+                     </div>
                    </div>
-                   <div className="bg-white border border-slate-200 rounded-[20px] md:rounded-[32px] overflow-hidden shadow-sm overflow-x-auto">
-                     <table className="w-full text-left min-w-[600px]">
-                       <thead>
-                         <tr className="border-b border-slate-100 bg-slate-50/50">
-                           <th className="px-6 md:px-8 py-4 md:py-5 text-[10px] md:text-[11px] font-black text-slate-400 uppercase tracking-widest text-nowrap">Topic Description</th>
-                           <th className="px-6 md:px-8 py-4 md:py-5 text-[10px] md:text-[11px] font-black text-slate-400 uppercase tracking-widest text-nowrap">Key Insights</th>
-                           <th className="px-6 md:px-8 py-4 md:py-5 text-[10px] md:text-[11px] font-black text-slate-400 uppercase tracking-widest text-nowrap">Date Added</th>
-                           <th className="px-6 md:px-8 py-4 md:py-5 text-[10px] md:text-[11px] font-black text-slate-400 uppercase tracking-widest text-right text-nowrap">Actions</th>
-                         </tr>
-                       </thead>
-                       <tbody className="divide-y divide-slate-50">
-                         {sessions.map(s => (
-                           <tr key={s.id} className="hover:bg-slate-50 transition-colors cursor-pointer group" onClick={() => loadSession(s.id)}>
-                             <td className="px-6 md:px-8 py-5 md:py-6">
-                               <div className="font-bold text-slate-900 flex items-center gap-3 md:gap-4 leading-tight">
-                                 <div className="w-8 h-8 md:w-10 md:h-10 bg-slate-50 text-slate-400 group-hover:bg-blue-50 group-hover:text-blue-500 rounded-lg md:rounded-xl flex items-center justify-center transition-colors shrink-0">
-                                   <BookOpen className="w-4 h-4 md:w-5 h-5" />
-                                 </div>
-                                 <span className="truncate max-w-[150px] md:max-w-[200px]">{s.name}</span>
-                               </div>
-                             </td>
-                             <td className="px-6 md:px-8 py-5 md:py-6 text-[13px] md:text-sm text-slate-500 font-medium">
-                               <div className="max-w-[200px] md:max-w-md truncate">{s.summary}</div>
-                             </td>
-                             <td className="px-6 md:px-8 py-5 md:py-6 text-[13px] md:text-sm text-slate-400 font-mono italic">
-                               {new Date(s.created_at!).toLocaleDateString()}
-                             </td>
-                             <td className="px-6 md:px-8 py-5 md:py-6 text-right">
-                                <button className="text-blue-600 font-black hover:text-blue-700 transition-colors text-[11px] md:text-sm uppercase tracking-widest whitespace-nowrap">Open Session</button>
-                             </td>
-                           </tr>
-                         ))}
-                       </tbody>
-                     </table>
+
+                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                     {sessions
+                       .filter(s => s.name.toLowerCase().includes(searchHistory.toLowerCase()) || (s.summary && s.summary.toLowerCase().includes(searchHistory.toLowerCase())))
+                       .map((session) => (
+                       <motion.div 
+                         layout
+                         key={session.id}
+                         onClick={() => loadSession(session.id)}
+                         className="bg-white border border-slate-200 p-8 rounded-[32px] hover:shadow-2xl hover:shadow-slate-200/50 transition-all cursor-pointer group flex flex-col h-full relative"
+                       >
+                         <div className="flex items-start justify-between mb-6">
+                           <div className="w-12 h-12 bg-blue-50 text-blue-600 rounded-2xl flex items-center justify-center shadow-inner shrink-0 group-hover:scale-110 transition-transform">
+                             <FileText className="w-6 h-6" />
+                           </div>
+                           <button 
+                             onClick={(e) => { e.stopPropagation(); deleteSession(session.id); }}
+                             className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                           >
+                             <Trash2 className="w-5 h-5" />
+                           </button>
+                         </div>
+                         
+                         <div className="space-y-4 flex-1">
+                           <div className="flex flex-col gap-1">
+                             <span className="text-[10px] text-slate-400 font-black uppercase tracking-widest">{new Date(session.created_at!).toLocaleDateString('bn-BD', { day: 'numeric', month: 'long', year: 'numeric' })}</span>
+                             <h3 className="font-extrabold text-xl leading-tight text-slate-900 group-hover:text-blue-600 transition-colors">{session.name}</h3>
+                           </div>
+                           <p className="text-slate-500 text-sm leading-relaxed line-clamp-4 font-medium italic overflow-hidden h-[5.6rem]">
+                             {session.summary || "No summary available for this session."}
+                           </p>
+                         </div>
+
+                         <div className="mt-8 pt-6 border-t border-slate-50 flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                               <div className="w-2 h-2 rounded-full bg-blue-500" />
+                               <span className="text-xs font-bold text-slate-500">Practice Session</span>
+                            </div>
+                            <span className="text-blue-600 font-bold text-sm flex items-center gap-1 group-hover:translate-x-1 transition-transform">
+                               শুরু করুন <ChevronLeft className="w-4 h-4 rotate-180" />
+                            </span>
+                         </div>
+                       </motion.div>
+                     ))}
+
+                     {sessions.length > 0 && sessions.filter(s => s.name.toLowerCase().includes(searchHistory.toLowerCase())).length === 0 && (
+                       <div className="col-span-full py-20 text-center space-y-4">
+                         <div className="w-20 h-20 bg-slate-50 rounded-full flex items-center justify-center mx-auto text-slate-200">
+                           <Search className="w-10 h-10" />
+                         </div>
+                         <h3 className="text-xl font-bold text-slate-900">কোন সেশন পাওয়া যায়নি</h3>
+                         <p className="text-slate-500">আপনার সার্চ কুয়েরি পরিবর্তন করে চেষ্টা করুন।</p>
+                       </div>
+                     )}
+
+                     {sessions.length === 0 && (
+                       <div className="col-span-full py-24 bg-white rounded-[40px] border-2 border-dotted border-slate-100 flex flex-col items-center px-10 text-center">
+                         <div className="w-20 h-20 bg-blue-50 text-blue-200 rounded-full flex items-center justify-center mb-6">
+                           <History className="w-10 h-10" />
+                         </div>
+                         <h3 className="text-2xl font-black text-slate-900 mb-2">ইতিহাস শুন্য!</h3>
+                         <p className="text-slate-500 font-medium mb-8 max-w-sm">আপনি এখনো কোনো স্টাডি সেশন শুরু করেননি। ড্যাশবোর্ড থেকে একটি ফাইল আপলোড করে শুরু করুন।</p>
+                         <button 
+                           onClick={() => setView('dashboard')}
+                           className="bg-slate-900 text-white px-8 py-4 rounded-2xl font-bold hover:bg-slate-800 transition-all active:scale-95 shadow-xl shadow-slate-900/10"
+                         >
+                           প্রথম সেশন শুরু করুন
+                         </button>
+                       </div>
+                     )}
                    </div>
                  </motion.div>
               )}
@@ -569,7 +777,8 @@ export default function App() {
         </div>
       </main>
     </div>
-  );
+  </div>
+);
 }
 
 function ProfileView({ 
