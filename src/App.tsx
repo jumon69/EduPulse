@@ -123,8 +123,8 @@ export default function App() {
 
       const cleanedContent = cleanExtractedText(content);
       
-      // Chunking for large files - smaller chunks for more exhaustive question extraction
-      const chunkSize = 5000;
+      // Chunking for large files - slightly larger chunks to balance detail and performance
+      const chunkSize = 7000;
       const chunks = [];
       for (let i = 0; i < cleanedContent.length; i += chunkSize) {
         chunks.push(cleanedContent.substring(i, i + chunkSize));
@@ -148,14 +148,19 @@ export default function App() {
         }));
         
         allQuestions = [...allQuestions, ...processedQuestions];
-        finalSummary += summary + " ";
+        finalSummary += (summary || "") + "\n";
+
+        // Small delay to prevent blocking the main thread too long and help garbage collection
+        if (chunks.length > 5) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
       }
 
       const sessionData: StudySession = {
         id: sessionId,
         name: getFileNameWithoutExtension(file.name),
-        content: cleanedContent,
-        summary: finalSummary.substring(0, 1000) + (finalSummary.length > 1000 ? "..." : ""),
+        content: "", // Don't store massive raw text in frontend state to prevent crashes
+        summary: finalSummary.substring(0, 2000) + (finalSummary.length > 2000 ? "..." : ""),
         questions: allQuestions
       };
 
@@ -163,7 +168,7 @@ export default function App() {
       await fetch('/api/save-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(sessionData)
+        body: JSON.stringify({ ...sessionData, content: cleanedContent.substring(0, 10000) }) // Only save a snippet to the DB
       });
 
       setSessions([sessionData, ...sessions]);

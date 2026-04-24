@@ -149,7 +149,14 @@ async function startServer() {
       // Run Python Logic
       const pyResult = await runPythonLogic(content);
 
-      res.json({ content, pyResult });
+      // Only send what's needed to the frontend to save memory
+      res.json({ 
+        content: pyResult.processed_text || content, 
+        stats: { 
+          word_count: pyResult.word_count, 
+          language: pyResult.language 
+        } 
+      });
     } catch (error: any) {
       console.error('Extraction error:', error);
       res.status(500).json({ error: error.message || 'Failed to extract text from material' });
@@ -160,8 +167,10 @@ async function startServer() {
     const { id, name, content, summary, questions } = req.body;
     
     try {
+      // Limit stored content in DB to prevent massive DB growth on mobile
+      const contentSnippet = typeof content === 'string' ? content.substring(0, 10000) : '';
       const insertSession = db.prepare('INSERT INTO study_sessions (id, name, content, summary) VALUES (?, ?, ?, ?)');
-      insertSession.run(id, name, content, summary);
+      insertSession.run(id, name, contentSnippet, summary);
 
       const insertQuestion = db.prepare('INSERT INTO questions (id, session_id, question, options, correct_idx, explanation) VALUES (?, ?, ?, ?, ?, ?)');
       
