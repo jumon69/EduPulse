@@ -1,0 +1,15 @@
+{
+  "name": "HSC MCQ Genie",
+  "short_name": "HSC Genie",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3242/3242063.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

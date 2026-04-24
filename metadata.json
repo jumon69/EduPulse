@@ -1,0 +1,8 @@
+{
+  "name": "HSC MCQ Genie",
+  "description": "Offline-first educational assistant for HSC suggestions. Parse PDF/Text, generate AI summaries, and practice with smart MCQs.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["AI-powered MCQ Generation", "Offline SQLite Database", "PDF Content Analysis"]
+}
