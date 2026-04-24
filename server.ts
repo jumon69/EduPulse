@@ -71,24 +71,45 @@ async function startServer() {
 
   app.use(express.json());
 
-  const upload = multer({ storage: multer.memoryStorage() });
+  const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      cb(null, '/tmp');
+    },
+    filename: (req, file, cb) => {
+      cb(null, `upload-${Date.now()}-${file.originalname}`);
+    }
+  });
+
+  const upload = multer({ 
+    storage: storage,
+    limits: {
+      fileSize: 350 * 1024 * 1024 // 350MB limit
+    }
+  });
 
   // API Routes
   app.post('/api/extract-text', upload.single('file'), async (req: any, res: any) => {
+    const fs = await import('fs/promises');
+    const filePath = req.file?.path;
+
     try {
       if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
       }
 
+      console.log(`Processing file: ${req.file.originalname} (${req.file.size} bytes)`);
+
       let content = '';
       const mimetype = req.file.mimetype;
 
       if (mimetype === 'application/pdf') {
-        const dataBuffer = req.file.buffer;
+        const dataBuffer = await fs.readFile(filePath);
+        console.log('PDF Read complete, starting parse...');
         let extractedText = '';
 
         // Handle the newer pdf-parse (mehmet-kozan version) which uses a class
         if (pdfModule && (pdfModule as any).PDFParse) {
+          console.log('Using PDFParse class...');
           const PDFParseClass = (pdfModule as any).PDFParse;
           const parser = new PDFParseClass({ data: dataBuffer });
           try {
@@ -102,6 +123,7 @@ async function startServer() {
         } 
         // Handle the classic pdf-parse (unreal-sh version) or interop as a function
         else if (typeof pdfModule === 'function' || (pdfModule as any).default) {
+          console.log('Using pdf-parse function...');
           const parseFunc = typeof pdfModule === 'function' ? pdfModule : (pdfModule as any).default;
           if (typeof parseFunc === 'function') {
              const data = await parseFunc(dataBuffer);
@@ -111,6 +133,7 @@ async function startServer() {
           }
         }
         else {
+          console.log('Attempting PDF require fallback...');
           // Last ditch effort: try to require it
           try {
             const require = createRequire(import.meta.url);
@@ -135,16 +158,20 @@ async function startServer() {
         content = extractedText;
       } 
       else if (mimetype.startsWith('image/')) {
-        const { data: { text } } = await Tesseract.recognize(req.file.buffer, 'ben+eng');
+        const dataBuffer = await fs.readFile(filePath);
+        const { data: { text } } = await Tesseract.recognize(dataBuffer, 'ben+eng');
         content = text;
       }
       else {
-        content = req.file.buffer.toString('utf-8');
+        const dataBuffer = await fs.readFile(filePath);
+        content = dataBuffer.toString('utf-8');
       }
       
       if (!content || !content.trim()) {
         return res.status(422).json({ error: 'No readable text content found in file. Ensure the PDF contains actual text (not scanned images) and is not password protected.' });
       }
+
+      console.log(`Extracted ${content.length} characters. Running python logic...`);
 
       // Run Python Logic
       const pyResult = await runPythonLogic(content);
@@ -160,6 +187,13 @@ async function startServer() {
     } catch (error: any) {
       console.error('Extraction error:', error);
       res.status(500).json({ error: error.message || 'Failed to extract text from material' });
+    } finally {
+      // Cleanup uploaded file
+      if (filePath) {
+        try {
+          await fs.unlink(filePath).catch(() => {});
+        } catch (e) {}
+      }
     }
   });
 

@@ -109,10 +109,16 @@ export default function App() {
   };
 
   const handleFileUploadInternal = async (file: File) => {
-    // Mobile optimization: Limit file size to 5MB
-    if (file.size > 5 * 1024 * 1024) {
-      alert("ফাইলটি অত্যন্ত বড় (৫ এমবি এর বেশি)। মোবাইল স্টাবিলিটির জন্য ৫ এমবি এর কম সাইজের ফাইল ব্যবহার করুন।");
+    // Mobile optimization & Stability: Limit file size to 300MB but warn about processing time
+    if (file.size > 300 * 1024 * 1024) {
+      alert("ফাইলটি অত্যন্ত বড় (৩০০ এমবি এর বেশি)। প্রসেসিং জটিলতার জন্য ৩০০ এমবি এর কম সাইজের ফাইল ব্যবহার করুন।");
       return;
+    }
+
+    if (file.size > 15 * 1024 * 1024) {
+      if (!confirm("ফাইলটি বেশ বড়। এটি প্রসেস হতে ৫-১০ মিনিট পর্যন্ত সময় নিতে পারে। আপনি কি চালিয়ে যেতে চান?")) {
+        return;
+      }
     }
 
     const existingSession = sessions.find(s => s.name === getFileNameWithoutExtension(file.name));
@@ -131,19 +137,28 @@ export default function App() {
       const formData = new FormData();
       formData.append('file', file);
 
-      setUploadProgress("10% - লেখা বের করা হচ্ছে (এটি কিছুক্ষণ সময় নিতে পারে)...");
+      setUploadProgress("10% - লেখা বের করা হচ্ছে (বড় ফাইলের জন্য ২-৫ মিনিট সময় লাগতে পারে)...");
       const extractRes = await fetch('/api/extract-text', {
         method: 'POST',
         body: formData
       });
       
+      let extractData;
+      const contentType = extractRes.headers.get("content-type");
+      if (contentType && contentType.includes("application/json")) {
+        extractData = await extractRes.json();
+      } else {
+        const textError = await extractRes.text();
+        console.error("Non-JSON response:", textError);
+        throw new Error(`সার্ভার থেকে ত্রুটিপূর্ণ রেসপন্স এসেছে (Code: ${extractRes.status})। ফাইলটি ছোট করে চেষ্টা করুন।`);
+      }
+      
       if (!extractRes.ok) {
-        const errorData = await extractRes.json();
-        throw new Error(errorData.error || "Failed to extract text");
+        throw new Error(extractData.error || "Failed to extract text");
       }
 
       setUploadProgress("40% - লেখা প্রসেস করা হচ্ছে...");
-      const { content } = await extractRes.json();
+      const { content } = extractData;
       
       if (!content) throw new Error("No content extracted from file");
 
