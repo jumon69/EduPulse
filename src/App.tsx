@@ -138,8 +138,11 @@ export default function App() {
       formData.append('file', file);
 
       setUploadProgress("10% - লেখা বের করা হচ্ছে (বড় ফাইলের জন্য ২-৫ মিনিট সময় লাগতে পারে)...");
-      const extractRes = await fetch('/api/extract-text', {
+      const extractRes = await fetch(`${window.location.origin}/api/extract-text`, {
         method: 'POST',
+        headers: {
+          'Accept': 'application/json'
+        },
         body: formData
       });
       
@@ -150,7 +153,8 @@ export default function App() {
       } else {
         const textError = await extractRes.text();
         console.error("Non-JSON response:", textError);
-        throw new Error(`সার্ভার থেকে ত্রুটিপূর্ণ রেসপন্স এসেছে (Code: ${extractRes.status})। ফাইলটি ছোট করে চেষ্টা করুন।`);
+        const snippet = textError.substring(0, 100);
+        throw new Error(`সার্ভার থেকে ত্রুটিপূর্ণ রেসপন্স এসেছে (Code: ${extractRes.status})। রেসপন্স ডেটা: ${snippet}... ফাইলটি ছোট করে চেষ্টা করুন।`);
       }
       
       if (!extractRes.ok) {
