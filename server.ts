@@ -10,27 +10,47 @@ import multer from 'multer';
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
-import { exec } from 'child_process';
+import { spawn } from 'child_process';
 import Tesseract from 'tesseract.js';
-
 import * as pdfModule from 'pdf-parse';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const db = new Database('hsc_mcq_genie.db');
 
-// Helper to run python logic
+// Improved Python interaction using spawn for large data
 async function runPythonLogic(text: string): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const process = exec('python3 processor.py', (error, stdout, stderr) => {
-      if (error) {
-        console.error('Python error:', stderr);
-        // Fallback to basic result if python fails
-        resolve({ word_count: text.split(/\s+/).length, language: 'unknown', processed_text: text });
-      }
-      else resolve(JSON.parse(stdout));
+  return new Promise((resolve) => {
+    const pyProcess = spawn('python3', ['processor.py']);
+    let outputData = '';
+    let errorData = '';
+
+    pyProcess.stdout.on('data', (data) => {
+      outputData += data.toString();
     });
-    process.stdin?.write(text);
-    process.stdin?.end();
+
+    pyProcess.stderr.on('data', (data) => {
+      errorData += data.toString();
+    });
+
+    pyProcess.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`Python process exited with code ${code}. Stderr: ${errorData}`);
+        resolve({ word_count: text.split(/\s+/).length, language: 'unknown', processed_text: text });
+      } else {
+        try {
+          resolve(JSON.parse(outputData));
+        } catch (e) {
+          console.error('Failed to parse Python output:', e);
+          resolve({ word_count: text.split(/\s+/).length, language: 'unknown', processed_text: text });
+        }
+      }
+    });
+
+    // Handle large standard input properly
+    pyProcess.stdin.write(text, (err) => {
+      if (err) console.error('Stdin write error:', err);
+      pyProcess.stdin.end();
+    });
   });
 }
 
@@ -43,6 +63,7 @@ db.exec(`
     summary TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+  CREATE INDEX IF NOT EXISTS idx_sessions_created ON study_sessions(created_at);
 
   CREATE TABLE IF NOT EXISTS questions (
     id TEXT PRIMARY KEY,
@@ -53,6 +74,7 @@ db.exec(`
     explanation TEXT,
     FOREIGN KEY(session_id) REFERENCES study_sessions(id)
   );
+  CREATE INDEX IF NOT EXISTS idx_questions_session ON questions(session_id);
 
   CREATE TABLE IF NOT EXISTS user_progress (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +83,7 @@ db.exec(`
     answered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(question_id) REFERENCES questions(id)
   );
+  CREATE INDEX IF NOT EXISTS idx_progress_question ON user_progress(question_id);
 `);
 
 // AI processing moved to frontend to comply with Gemini API security guidelines.
@@ -69,113 +92,82 @@ async function startServer() {
   const app = express();
   const port = 3000;
 
-  app.use(express.json({ limit: '350mb' }));
-  app.use(express.urlencoded({ limit: '350mb', extended: true }));
-
-  // Global error handler for JSON
-  app.use((err: any, req: any, res: any, next: any) => {
-    if (err instanceof multer.MulterError) {
-      return res.status(400).json({ error: `Upload error: ${err.message}` });
-    }
-    next(err);
-  });
-
-  app.use('/api', (req, res, next) => {
-    console.log(`[MCQ-GENIE-API] ${req.method} ${req.url}`);
+  // Global Request Logger - BEFORE EVERYTHING ELSE
+  app.use((req, res, next) => {
+    console.log(`[GLOBAL-LOG] ${req.method} ${req.originalUrl} - IP: ${req.ip}`);
     next();
   });
 
-  // Use memory storage for smaller files if disk is failing for some reason
+  app.use(express.json({ limit: "500mb" }));
+  app.use(express.urlencoded({ limit: "500mb", extended: true }));
+
   const upload = multer({ 
     storage: multer.diskStorage({
-      destination: '/tmp',
+      destination: "/tmp",
       filename: (req, file, cb) => {
-        cb(null, `mcq-${Date.now()}-${file.originalname.replace(/[^a-z0-9.]/gi, '_')}`);
+        cb(null, `mcq-${Date.now()}-${file.originalname.replace(/[^a-z0-9.]/gi, "_")}`);
       }
     }),
-    limits: { fileSize: 350 * 1024 * 1024 }
+    limits: { 
+      fileSize: 400 * 1024 * 1024,
+      fieldSize: 400 * 1024 * 1024
+    }
   });
 
-  app.post('/api/extract-text', (req, res, next) => {
-    console.log('Hitting extract-text route handler');
-    next();
-  }, upload.single('file'), async (req: any, res: any) => {
-    console.log('Multer finished upload. File:', req.file?.originalname);
-    const fs = await import('fs/promises');
+  // Direct API Routes
+  app.post("/api/extract-text", upload.single("file"), async (req: any, res: any) => {
+    console.log(`[API-LOG] Extract text request for: ${req.file?.originalname}`);
+    const fs = await import("fs/promises");
     const filePath = req.file?.path;
 
     try {
       if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded' });
+        return res.status(400).json({ error: "ফাইল পাওয়া যায়নি বা অবৈধ ফরম্যাট।" });
       }
 
-      console.log(`Processing file: ${req.file.originalname} (${req.file.size} bytes)`);
-
-      let content = '';
+      let content = "";
       const mimetype = req.file.mimetype;
-
-      const isPdf = mimetype === 'application/pdf' || req.file.originalname.toLowerCase().endsWith('.pdf');
+      const isPdf = mimetype === "application/pdf" || req.file.originalname.toLowerCase().endsWith(".pdf");
       
       if (isPdf) {
         const dataBuffer = await fs.readFile(filePath);
-        console.log('PDF Read complete, starting parse...');
-        let extractedText = '';
+        let extractedText = "";
 
         try {
-          // Handle the newer pdf-parse (mehmet-kozan version) which uses a class
           if (pdfModule && (pdfModule as any).PDFParse) {
-            console.log('Using PDFParse class...');
             const PDFParseClass = (pdfModule as any).PDFParse;
             const parser = new PDFParseClass({ data: dataBuffer });
             const result = await parser.getText();
-            extractedText = result.text || '';
+            extractedText = result.text || "";
             await parser.destroy();
-          } 
-          // Handle the classic pdf-parse (unreal-sh version) or interop as a function
-          else if (typeof pdfModule === 'function' || (pdfModule as any).default) {
-            console.log('Using pdf-parse function...');
-            const parseFunc = typeof pdfModule === 'function' ? pdfModule : (pdfModule as any).default;
-            if (typeof parseFunc === 'function') {
-               const data = await parseFunc(dataBuffer);
-               extractedText = data.text || '';
-            } else {
-               throw new Error('PDF parsing function not found');
-            }
-          }
-          else {
-            console.log('Attempting PDF require fallback...');
+          } else {
             const require = createRequire(import.meta.url);
-            const pdfReq = require('pdf-parse');
+            const pdfReq = require("pdf-parse");
             const data = await pdfReq(dataBuffer);
-            extractedText = data.text || '';
+            extractedText = data.text || "";
           }
-        } catch (pdfErr) {
-          console.error('PDF library failed, trying backup parser...');
-          throw pdfErr;
+        } catch (pdfErr: any) {
+          console.error("PDF Parse error:", pdfErr);
+          throw new Error("পিডিএফ ফাইলটি পড়া যাচ্ছে না।");
         }
-
         content = extractedText;
       } 
-      else if (mimetype.startsWith('image/')) {
+      else if (mimetype.startsWith("image/")) {
         const dataBuffer = await fs.readFile(filePath);
-        const { data: { text } } = await Tesseract.recognize(dataBuffer, 'ben+eng');
+        const { data: { text } } = await Tesseract.recognize(dataBuffer, "ben+eng");
         content = text;
       }
       else {
         const dataBuffer = await fs.readFile(filePath);
-        content = dataBuffer.toString('utf-8');
+        content = dataBuffer.toString("utf-8");
       }
       
       if (!content || !content.trim()) {
-        return res.status(422).json({ error: 'No readable text content found in file. Ensure the PDF contains actual text (not scanned images) and is not password protected.' });
+        return res.status(422).json({ error: "ফাইল থেকে কোনো লেখা পাওয়া যায়নি।" });
       }
 
-      console.log(`Extracted ${content.length} characters. Running python logic...`);
-
-      // Run Python Logic
       const pyResult = await runPythonLogic(content);
 
-      res.setHeader('Content-Type', 'application/json');
       res.json({ 
         content: pyResult.processed_text || content, 
         stats: { 
@@ -184,83 +176,53 @@ async function startServer() {
         } 
       });
     } catch (error: any) {
-      console.error('Extraction error:', error);
-      res.status(500).json({ error: error.message || 'টেক্সট এক্সট্রাকশন ব্যর্থ হয়েছে।' });
+      console.error("API Error:", error);
+      res.status(500).json({ error: "সার্ভারে সমস্যা হয়েছে: " + (error.message || "Unknown error") });
     } finally {
-      // Cleanup uploaded file
       if (filePath) {
-        try {
-          await fs.unlink(filePath).catch(() => {});
-        } catch (e) {}
+        try { await fs.unlink(filePath).catch(() => {}); } catch (e) {}
       }
     }
   });
 
-  app.post('/api/save-session', (req: any, res: any) => {
+  app.post("/api/save-session", (req: any, res: any) => {
     const { id, name, content, summary, questions } = req.body;
-    
     try {
-      // Limit stored content in DB to prevent massive DB growth on mobile
-      const contentSnippet = typeof content === 'string' ? content.substring(0, 10000) : '';
-      const insertSession = db.prepare('INSERT INTO study_sessions (id, name, content, summary) VALUES (?, ?, ?, ?)');
-      insertSession.run(id, name, contentSnippet, summary);
-
-      const insertQuestion = db.prepare('INSERT INTO questions (id, session_id, question, options, correct_idx, explanation) VALUES (?, ?, ?, ?, ?, ?)');
-      
+      const contentSnippet = typeof content === "string" ? content.substring(0, 20000) : "";
+      db.prepare("INSERT INTO study_sessions (id, name, content, summary) VALUES (?, ?, ?, ?)").run(id, name, contentSnippet, summary);
+      const insertQuestion = db.prepare("INSERT INTO questions (id, session_id, question, options, correct_idx, explanation) VALUES (?, ?, ?, ?, ?, ?)");
       const transaction = db.transaction((qs: any[]) => {
-        for (const q of qs) {
-          insertQuestion.run(q.id, id, q.question, JSON.stringify(q.options), q.correctIdx, q.explanation);
-        }
+        for (const q of qs) insertQuestion.run(q.id, id, q.question, JSON.stringify(q.options), q.correctIdx, q.explanation);
       });
-
       transaction(questions);
       res.json({ success: true });
     } catch (error) {
-      console.error('Save session error:', error);
-      res.status(500).json({ error: 'Failed to save session' });
+      res.status(500).json({ error: "Save failed" });
     }
   });
 
-  app.get('/api/sessions', (req: any, res: any) => {
-    const sessions = db.prepare('SELECT * FROM study_sessions ORDER BY created_at DESC').all();
-    res.json(sessions);
+  app.get("/api/sessions", (req: any, res: any) => {
+    res.json(db.prepare("SELECT * FROM study_sessions ORDER BY created_at DESC").all());
   });
 
-  app.get('/api/session/:id', (req: any, res: any) => {
-    const session: any = db.prepare('SELECT * FROM study_sessions WHERE id = ?').get(req.params.id);
-    const questions: any[] = db.prepare('SELECT * FROM questions WHERE session_id = ?').all();
-    
-    if (!session) return res.status(404).json({ error: 'Session not found' });
-    
-    res.json({ 
-      ...session, 
-      questions: questions.map((q: any) => ({
-        ...q,
-        options: JSON.parse(q.options)
-      }))
-    });
+  app.get("/api/session/:id", (req: any, res: any) => {
+    const session: any = db.prepare("SELECT * FROM study_sessions WHERE id = ?").get(req.params.id);
+    if (!session) return res.status(404).json({ error: "Not found" });
+    const questions: any[] = db.prepare("SELECT * FROM questions WHERE session_id = ?").all();
+    res.json({ ...session, questions: questions.map((q: any) => ({ ...q, options: JSON.parse(q.options) })) });
   });
 
-  app.post('/api/track-progress', (req: any, res: any) => {
-    const { question_id, is_correct } = req.body;
-    db.prepare('INSERT INTO user_progress (question_id, is_correct) VALUES (?, ?)').run(question_id, is_correct ? 1 : 0);
+  app.post("/api/track-progress", (req: any, res: any) => {
+    db.prepare("INSERT INTO user_progress (question_id, is_correct) VALUES (?, ?)").run(req.body.question_id, req.body.is_correct ? 1 : 0);
     res.json({ success: true });
   });
 
-  app.get('/api/stats', (req: any, res: any) => {
-    const stats: any = db.prepare(`
-      SELECT 
-        COUNT(*) as total_attempts,
-        IFNULL(SUM(is_correct), 0) as correct_answers
-      FROM user_progress
-    `).get();
+  app.get("/api/stats", (req: any, res: any) => {
+    const stats: any = db.prepare("SELECT COUNT(*) as total_attempts, IFNULL(SUM(is_correct), 0) as correct_answers FROM user_progress").get();
     res.json(stats);
   });
 
-  // Final catch-all for /api before Vite middleware
-  app.all('/api/*', (req, res) => {
-    res.status(404).json({ error: `API endpoint ${req.url} not found` });
-  });
+  app.get("/api/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
 
   // Vite Integration
   if (process.env.NODE_ENV !== 'production') {

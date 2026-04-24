@@ -137,28 +137,39 @@ export default function App() {
       const formData = new FormData();
       formData.append('file', file);
 
-      setUploadProgress("10% - লেখা বের করা হচ্ছে (বড় ফাইলের জন্য ২-৫ মিনিট সময় লাগতে পারে)...");
-      const extractRes = await fetch(`${window.location.origin}/api/extract-text`, {
+      setUploadProgress("10% - লেখা বের করা হচ্ছে (বড় ফাইলের জন্য ৫-১০ মিনিট সময় লাগতে পারে)...");
+      
+      const fetchUrl = `/api/extract-text?_t=${Date.now()}`;
+      console.log(`[MCQ-GENIE] Calling: ${fetchUrl}`);
+
+      const extractRes = await fetch(fetchUrl, {
         method: 'POST',
         headers: {
-          'Accept': 'application/json'
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest'
         },
         body: formData
       });
       
-      let extractData;
       const contentType = extractRes.headers.get("content-type");
+      let extractData;
+
       if (contentType && contentType.includes("application/json")) {
         extractData = await extractRes.json();
       } else {
         const textError = await extractRes.text();
-        console.error("Non-JSON response:", textError);
+        console.error("Non-JSON response received:", textError);
+        
+        if (textError.includes("<!doctype html>")) {
+          throw new Error("সার্ভারের সাথে সংযোগ বিচ্ছিন্ন হয়েছে বা ফাইলটি অত্যন্ত বড়। অনুগ্রহ করে একবার রিফ্রেশ দিয়ে আবার ছোট ফাইল (১০০ এমবির কম) দিয়ে চেষ্টা করুন।");
+        }
+        
         const snippet = textError.substring(0, 100);
-        throw new Error(`সার্ভার থেকে ত্রুটিপূর্ণ রেসপন্স এসেছে (Code: ${extractRes.status})। রেসপন্স ডেটা: ${snippet}... ফাইলটি ছোট করে চেষ্টা করুন।`);
+        throw new Error(`সার্ভার থেকে অস্পষ্ট রেসপন্স এসেছে (Error ${extractRes.status})। বিস্তারিত: ${snippet}...`);
       }
       
       if (!extractRes.ok) {
-        throw new Error(extractData.error || "Failed to extract text");
+        throw new Error(extractData.error || "ফাইলটি প্রসেস করতে সমস্যা হয়েছে।");
       }
 
       setUploadProgress("40% - লেখা প্রসেস করা হচ্ছে...");
@@ -627,7 +638,23 @@ export default function App() {
                   {/* Recent Sessions */}
                   <div className="pt-4">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 md:mb-8 gap-4">
-                      <h2 className="text-xl md:text-2xl font-black tracking-tight text-slate-900">সাম্প্রতিক সেশনসমূহ</h2>
+                      <div className="flex flex-col">
+                        <h2 className="text-xl md:text-2xl font-black tracking-tight text-slate-900">সাম্প্রতিক সেশনসমূহ</h2>
+                        <button 
+                          onClick={async () => {
+                            try {
+                              const res = await fetch(`/api/health?_t=${Date.now()}`);
+                              const data = await res.json();
+                              alert(`Server is UP at ${data.time}`);
+                            } catch (e) {
+                              alert(`Server connection failed: ${e}`);
+                            }
+                          }}
+                          className="text-[10px] text-left text-slate-400 hover:text-blue-500 underline mt-1"
+                        >
+                          সার্ভার কানেকশন চেক করুন
+                        </button>
+                      </div>
                       <div className="flex gap-4">
                         <button onClick={() => setView('history')} className="text-sm font-bold text-blue-600 hover:text-blue-700 flex items-center gap-2 group transition-colors">
                           সবগুলো দেখুন <ChevronLeft className="w-4 h-4 rotate-180 group-hover:translate-x-1 transition-transform" />
