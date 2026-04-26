@@ -103,35 +103,54 @@ async function startServer() {
 
   const upload = multer({ 
     storage: multer.diskStorage({
-      destination: "/tmp",
+      destination: path.join(__dirname, "temp_uploads"),
       filename: (req, file, cb) => {
-        cb(null, `mcq-${Date.now()}-${file.originalname.replace(/[^a-z0-9.]/gi, "_")}`);
+        cb(null, `mcq-${Date.now()}-${Math.random().toString(36).substring(2, 7)}-${file.originalname.replace(/[^a-z0-9.]/gi, "_")}`);
       }
     }),
     limits: { 
-      fileSize: 1024 * 1024 * 1024, // 1GB limit for combined file
+      fileSize: 1024 * 1024 * 1024, // 1GB
       fieldSize: 1024 * 1024 * 1024
     }
   });
 
+  // Ensure temp directories exist and clean up old ones on start
+  const fs = await import("fs/promises");
+  const tempUploadsDir = path.join(__dirname, "temp_uploads");
+  const chunksDir = path.join(__dirname, "chunks");
+  
+  await fs.mkdir(tempUploadsDir, { recursive: true });
+  await fs.mkdir(chunksDir, { recursive: true });
+  
+  // Optional cleanup on start
+  try {
+    const chunkFiles = await fs.readdir(chunksDir);
+    for (const f of chunkFiles) {
+      await fs.rm(path.join(chunksDir, f), { recursive: true, force: true }).catch(() => {});
+    }
+  } catch (e) {}
+
   // Chunked Upload Endpoint
   app.post("/api/upload-chunk", upload.single("chunk"), async (req: any, res: any) => {
-    const { uploadId, index, total } = req.body;
-    const fs = await import("fs/promises");
-    const path = await import("path");
+    const { uploadId, index } = req.body;
     
     if (!uploadId || index === undefined || !req.file) {
+      console.error("[API-ERROR] Missing chunk data for uploadId:", uploadId);
       return res.status(400).json({ error: "Missing chunk data" });
     }
 
-    const chunkDir = path.join("/tmp", "chunks", uploadId);
+    const chunkDir = path.join(__dirname, "chunks", uploadId);
     try {
       await fs.mkdir(chunkDir, { recursive: true });
       const chunkPath = path.join(chunkDir, index.toString());
-      await fs.rename(req.file.path, chunkPath);
+      
+      // Use copyFile + unlink for better reliability across different filesystems
+      await fs.copyFile(req.file.path, chunkPath);
+      await fs.unlink(req.file.path).catch(() => {});
+      
       res.json({ success: true, index });
     } catch (e: any) {
-      console.error("Chunk upload error:", e);
+      console.error(`[API-ERROR] Chunk upload error (ID: ${uploadId}, index: ${index}):`, e);
       res.status(500).json({ error: e.message });
     }
   });
@@ -139,36 +158,41 @@ async function startServer() {
   // Reassemble and Extract Text
   app.post("/api/extract-text-chunked", async (req: any, res: any) => {
     const { uploadId, fileName, totalChunks } = req.body;
-    const fs = await import("fs/promises");
-    const path = await import("path");
-    
-    console.log(`[API-LOG] Reassembling ${fileName} (${totalChunks} chunks) for uploadId: ${uploadId}`);
     
     if (!uploadId || !totalChunks) {
       return res.status(400).json({ error: "Missing upload identity" });
     }
 
-    const chunkDir = path.join("/tmp", "chunks", uploadId);
-    const finalPath = path.join("/tmp", `mcq-final-${Date.now()}-${fileName.replace(/[^a-z0-9.]/gi, "_")}`);
+    const chunkDir = path.join(__dirname, "chunks", uploadId);
+    const finalDir = path.join(__dirname, "temp_uploads");
+    const finalPath = path.join(finalDir, `mcq-final-${Date.now()}-${fileName.replace(/[^a-z0-9.]/gi, "_")}`);
+    
+    console.log(`[API-LOG] Reassembling ${fileName} (${totalChunks} chunks) -> ${finalPath}`);
     
     try {
-      // Reassemble - Use appendFile to combine chunks
+      // Ensure directory exists
+      await fs.mkdir(finalDir, { recursive: true });
+      
+      // Clear finalPath if it somehow exists
+      try { await fs.unlink(finalPath).catch(() => {}); } catch(e) {}
+
+      // Reassemble - sequentially to maintain order and avoid memory spikes
       for (let i = 0; i < totalChunks; i++) {
         const chunkPath = path.join(chunkDir, i.toString());
         try {
           const chunkData = await fs.readFile(chunkPath);
           await fs.appendFile(finalPath, chunkData);
-          console.log(`[API-LOG] Appended chunk ${i} for ${uploadId}`);
         } catch (readErr) {
-          console.error(`Error reading chunk ${i} from ${chunkPath}:`, readErr);
-          throw new Error(`চাক্স ${i} পাওয়া যায়নি বা পড়া যাচ্ছে না।`);
+          console.error(`[API-ERROR] Chunk ${i} missing for ${uploadId} mapping to ${chunkPath}`);
+          throw new Error(`চাক্স ${i} পাওয়া যায়নি। আবার আপলোড করুন।`);
         }
       }
 
       const fileStats = await fs.stat(finalPath);
-      console.log(`[API-LOG] Reassembly complete. Final size: ${fileStats.size} bytes`);
+      if (fileStats.size === 0) throw new Error("সংগৃহীত ফাইলটি ফাঁকা।");
 
-      // Improved mimetype detection for images and docs
+      console.log(`[API-LOG] Reassembly successful. ${fileStats.size} bytes.`);
+
       let mimetype = "text/plain";
       const ext = fileName.toLowerCase();
       if (ext.endsWith(".pdf")) mimetype = "application/pdf";
@@ -180,14 +204,16 @@ async function startServer() {
       await processFile(finalPath, fileName, mimetype, res);
       
     } catch (e: any) {
-      console.error("Reassembly error:", e);
+      console.error("[API-ERROR] Reassembly/Extraction error:", e);
       if (!res.headersSent) {
         res.status(500).json({ error: "ফাইল প্রসেসিং ব্যর্থ হয়েছে: " + e.message });
       }
     } finally {
-      // ALWAYS cleanup
-      try { await fs.rm(chunkDir, { recursive: true, force: true }).catch(() => {}); } catch (e) {}
-      try { await fs.unlink(finalPath).catch(() => {}); } catch (e) {}
+      // Cleanup chunks and reassembled file
+      setTimeout(async () => {
+        try { await fs.rm(chunkDir, { recursive: true, force: true }).catch(() => {}); } catch (e) {}
+        try { await fs.unlink(finalPath).catch(() => {}); } catch (e) {}
+      }, 5000); // Slight delay for safety
     }
   });
 
@@ -200,30 +226,25 @@ async function startServer() {
       const isImage = mimetype.startsWith("image/") || /\.(jpg|jpeg|png|webp|bmp)$/i.test(originalName);
       
       if (isPdf) {
-        const dataBuffer = await fs.readFile(filePath);
-        let extractedText = "";
-
         try {
+          const dataBuffer = await fs.readFile(filePath);
           const require = createRequire(import.meta.url);
-          const pdfReq = require("pdf-parse");
-          const pdf = typeof pdfReq === 'function' ? pdfReq : pdfReq.default;
+          const pdfParse = require("pdf-parse");
           
-          if (typeof pdf !== 'function') {
-            console.error("pdf-parse is not a function. pdfReq:", pdfReq);
-            throw new Error("পিডিএফ প্রসেসিং সার্ভার এরর।");
+          // PDF Parsing can be CPU intensive and error-prone in Node ESM
+          const data = await pdfParse(dataBuffer);
+          content = data.text || "";
+          console.log(`[API-LOG] PDF extracted. Chars: ${content.length}`);
+          
+          // Fallback to OCR if PDF text is too short (scanned PDF)
+          if (content.trim().length < 50 && content.trim().length > 0) {
+             console.log("[API-LOG] PDF text too short, might be a scan. You might need OCR separately.");
           }
-          
-          const data = await pdf(dataBuffer).catch((e: any) => {
-            console.error("pdf-parse internal error:", e);
-            throw e;
-          });
-          extractedText = data.text || "";
-          console.log(`[API-LOG] PDF text extracted. Length: ${extractedText.length}`);
         } catch (pdfErr: any) {
-          console.error("PDF Parsing failed:", pdfErr);
-          throw new Error("পিডিএফ ফাইলটি পড়া যাচ্ছে না। এটি এনক্রিপ্টেড বা পাসওয়ার্ড প্রটেক্টেড কি না চেক করুন।");
+          console.error("[API-ERROR] PDF Parser fatal:", pdfErr);
+          // If PDF parse fails, let's try to see if it's maybe just a text/image disguised or corrupted
+          throw new Error("পিডিএফ ফাইলটি পড়া যায়নি। এটি কি পাসওয়ার্ড প্রটেক্টেড? দয়া করে আনলক করে পুনরায় চেষ্টা করুন।");
         }
-        content = extractedText;
       } 
       else if (isImage) {
         console.log(`[API-LOG] Starting OCR for image: ${originalName}`);
@@ -326,6 +347,18 @@ async function startServer() {
 
   app.get("/api/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
 
+  app.delete("/api/session/:id", (req: any, res: any) => {
+    try {
+      db.prepare("DELETE FROM user_progress WHERE question_id IN (SELECT id FROM questions WHERE session_id = ?)").run(req.params.id);
+      db.prepare("DELETE FROM questions WHERE session_id = ?").run(req.params.id);
+      db.prepare("DELETE FROM study_sessions WHERE id = ?").run(req.params.id);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("[API-ERROR] Delete session failed:", error);
+      res.status(500).json({ error: "Delete failed" });
+    }
+  });
+
   // Vite Integration
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -357,8 +390,9 @@ async function startServer() {
 
   // Set timeout to 10 minutes for large file processing
   server.timeout = 600000;
-  server.keepAliveTimeout = 61000;
-  server.headersTimeout = 62000;
+  server.requestTimeout = 600000;
+  server.keepAliveTimeout = 601000;
+  server.headersTimeout = 602000;
 }
 
 startServer();

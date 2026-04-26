@@ -29,7 +29,7 @@ export async function analyzeMaterial(text: string): Promise<GeneratedContent> {
   }
 
   const response = await activeAi.models.generateContent({ 
-    model: "gemini-1.5-flash", 
+    model: "gemini-1.5-flash-latest", 
     contents: `Analyze the following HSC study material/question paper. Your goal is to be EXHAUSTIVE and extract or generate EVERY possible MCQ from this text.
     
     CRITICAL INSTRUCTIONS:

@@ -173,16 +173,27 @@ export default function App() {
 
       setUploadProgress("40% - ফাইল প্রসেস করা হচ্ছে...");
       
-      // 2. Finalize and extract text
-      const finalizeRes = await fetch('/api/extract-text-chunked', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uploadId, fileName: file.name, totalChunks })
-      });
+      // 2. Finalize and extract text with retry
+      let finalizeRes;
+      let finalizeRetry = 0;
+      while (finalizeRetry < 3) {
+        try {
+          finalizeRes = await fetch('/api/extract-text-chunked', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uploadId, fileName: file.name, totalChunks })
+          });
+          if (finalizeRes.ok) break;
+        } catch (e) {
+          console.warn(`Finalize attempt ${finalizeRetry} failed`, e);
+        }
+        finalizeRetry++;
+        await new Promise(r => setTimeout(r, 2000));
+      }
 
-      if (!finalizeRes.ok) {
-        const errData = await finalizeRes.json();
-        throw new Error(errData.error || "ফাইল জোড়া লাগাতে সমস্যা হয়েছে।");
+      if (!finalizeRes || !finalizeRes.ok) {
+        const errData = finalizeRes ? await finalizeRes.json().catch(() => ({})) : {};
+        throw new Error(errData.error || "ফাইল প্রসেস করতে সমস্যা হয়েছে। নেটওয়ার্ক চেক করে আবার চেষ্টা করুন।");
       }
 
       const extractData = await finalizeRes.json();
@@ -193,10 +204,10 @@ export default function App() {
       const cleanedContent = cleanExtractedText(content);
       
       // Chunking for analysis - increase capacity for large files significantly
-      const chunkSize = 15000;
+      const chunkSize = 30000;
       const chunks = [];
-      // Increased to 80 chunks for better coverage (up to 1.2M characters)
-      for (let i = 0; i < cleanedContent.length && chunks.length < 80; i += chunkSize) {
+      // Max 20 chunks to avoid excessive mobile network load
+      for (let i = 0; i < cleanedContent.length && chunks.length < 20; i += chunkSize) {
         chunks.push(cleanedContent.substring(i, i + chunkSize));
       }
 
@@ -209,23 +220,31 @@ export default function App() {
         const chunkProgress = Math.round(40 + ((i / chunks.length) * 50));
         setUploadProgress(`${chunkProgress}% - AI দিয়ে বিশ্লেষণ করা হচ্ছে (অংশ ${i + 1}/${chunks.length})...`);
         
-        try {
-          const { summary, questions } = await analyzeMaterial(chunks[i]);
-          
-          if (questions && Array.isArray(questions) && questions.length > 0) {
-            const processedQuestions = questions.map((q, qIdx) => ({
-              ...q,
-              id: `${sessionId}-q-${i}-${qIdx}-${Math.random().toString(36).substring(2, 7)}`
-            }));
-            allQuestions = [...allQuestions, ...processedQuestions];
+        let chunkRetry = 0;
+        let chunkSuccess = false;
+        
+        while (chunkRetry < 2 && !chunkSuccess) {
+          try {
+            const { summary, questions } = await analyzeMaterial(chunks[i]);
+            
+            if (questions && Array.isArray(questions) && questions.length > 0) {
+              const processedQuestions = questions.map((q, qIdx) => ({
+                ...q,
+                id: `${sessionId}-q-${i}-${qIdx}-${Math.random().toString(36).substring(2, 7)}`
+              }));
+              allQuestions = [...allQuestions, ...processedQuestions];
+            }
+            
+            if (summary) {
+              finalSummary += summary + "\n";
+            }
+            chunkSuccess = true;
+          } catch (analysisErr: any) {
+            chunkRetry++;
+            console.error(`[MCQ-GENIE] Chunk ${i} analysis attempt ${chunkRetry} failed:`, analysisErr);
+            lastError = analysisErr.message || String(analysisErr);
+            if (chunkRetry < 2) await new Promise(r => setTimeout(r, 2000));
           }
-          
-          if (summary) {
-            finalSummary += summary + "\n";
-          }
-        } catch (analysisErr: any) {
-          console.error(`[MCQ-GENIE] Chunk ${i} analysis failed:`, analysisErr);
-          lastError = analysisErr.message || String(analysisErr);
         }
       }
 
@@ -249,7 +268,7 @@ export default function App() {
       await fetch('/api/save-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...sessionData, content: cleanedContent.substring(0, 10000) })
+        body: JSON.stringify({ ...sessionData, content: cleanedContent.substring(0, 500000) })
       });
 
       setSessions([sessionData, ...sessions]);
@@ -258,9 +277,15 @@ export default function App() {
       setIsSidebarOpen(false);
     } catch (err: any) {
       console.error("[MCQ-GENIE] Upload failed:", err);
-      setUploadError(err.message || "একটি অপ্রত্যাশিত সমস্যা হয়েছে।");
-      // alert persists as fallback
-      alert(err.message || "Something went wrong. Please check your connection and configuration.");
+      let errorMsg = err.message || "একটি অপ্রত্যাশিত সমস্যা হয়েছে।";
+      
+      if (errorMsg.includes("Failed to fetch") || errorMsg.includes("load failed")) {
+        errorMsg = "সার্ভারের সাথে যোগাযোগ বিচ্ছিন্ন হয়েছে। আপনার ইন্টারনেট কানেকশন চেক করে আবার চেষ্টা করুন। (Network Error)";
+      }
+      
+      setUploadError(errorMsg);
+      // alert persists as fallback for critical issues
+      if (errorMsg.length < 100) alert(errorMsg);
     } finally {
       setIsUploading(false);
       setUploadProgress("");
