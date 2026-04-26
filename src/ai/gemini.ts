@@ -28,19 +28,19 @@ export async function analyzeMaterial(text: string): Promise<GeneratedContent> {
     throw new Error("GEMINI_API_KEY is not configured. AI features are unavailable.");
   }
 
-  const response = await activeAi.models.generateContent({
-    model: "gemini-3-flash-preview",
+  const response = await activeAi.models.generateContent({ 
+    model: "gemini-1.5-flash", 
     contents: `Analyze the following HSC study material/question paper. Your goal is to be EXHAUSTIVE and extract or generate EVERY possible MCQ from this text.
     
     CRITICAL INSTRUCTIONS:
     1. All generated/extracted text MUST be in Bengali (Bangla) script.
-    2. If the text already contains Multiple Choice Questions (MCQs), EXTRACT THEM ALL exactly as they are. 
-    3. If the text is study material, generate a question for every single concept, fact, or definition.
-    4. DO NOT SUMMARIZE or SKIP any part of the text. I need absolute coverage.
-    5. Output as many questions as the text supports (no upper limit per chunk).
+    2. Format precisely as JSON.
+    3. Include 4 options per question.
+    4. Provide the correct index (0-3) and a short explanation.
+    5. Output as many questions as the text supports (no upper limit).
     
     Material Content:
-    ${text.substring(0, 10000)}`,
+    ${text}`,
     config: {
       responseMimeType: "application/json",
       responseSchema: {
@@ -52,16 +52,15 @@ export async function analyzeMaterial(text: string): Promise<GeneratedContent> {
             items: {
               type: Type.OBJECT,
               properties: {
-                id: { type: Type.STRING },
                 question: { type: Type.STRING },
                 options: { 
                   type: Type.ARRAY, 
-                  items: { type: Type.STRING }
+                  items: { type: Type.STRING } 
                 },
-                correctIdx: { type: Type.INTEGER },
+                correctIdx: { type: Type.NUMBER },
                 explanation: { type: Type.STRING }
               },
-              required: ["id", "question", "options", "correctIdx", "explanation"]
+              required: ["question", "options", "correctIdx", "explanation"]
             }
           }
         },
@@ -71,10 +70,12 @@ export async function analyzeMaterial(text: string): Promise<GeneratedContent> {
   });
 
   try {
-    const result = JSON.parse(response.text);
+    const output = response.text;
+    if (!output) throw new Error("AI returned empty response");
+    const result = JSON.parse(output);
     return result as GeneratedContent;
   } catch (err) {
-    console.error("Failed to parse Gemini response:", response.text);
-    throw new Error("The AI returned an invalid format. Please try again.");
+    console.error("Failed to parse Gemini response. Response object:", response);
+    throw new Error("AI রেসপন্স প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।");
   }
 }

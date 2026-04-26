@@ -31,6 +31,7 @@ export default function App() {
   const [activeSession, setActiveSession] = useState<StudySession | null>(null);
   const [stats, setStats] = useState<Stats>({ total_attempts: 0, correct_answers: 0 });
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState("");
   const [view, setView] = useState<'dashboard' | 'quiz' | 'history' | 'profile'>('dashboard');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -40,6 +41,8 @@ export default function App() {
   const [userApiKey, setUserApiKey] = useState(() => localStorage.getItem('hsc_gemini_api_key') || '');
   const [joke, setJoke] = useState('');
   const [searchHistory, setSearchHistory] = useState("");
+  const [filterTopic, setFilterTopic] = useState<string>('all');
+  const [sortOrder, setSortOrder] = useState<'newest' | 'oldest' | 'az'>('newest');
 
   const jokes = [
     "ডাক্তার: আপনার দাঁত তো সব ঠিকই আছে, তাহলে ব্যথা কেন?\nরোগী: দাঁতগুলো ঠিক ঠিক জায়গায় নেই ডাক্তার সাহেব, একটা তো আমার পকেটে!",
@@ -109,18 +112,6 @@ export default function App() {
   };
 
   const handleFileUploadInternal = async (file: File) => {
-    // Mobile optimization & Stability: Limit file size to 300MB but warn about processing time
-    if (file.size > 300 * 1024 * 1024) {
-      alert("ফাইলটি অত্যন্ত বড় (৩০০ এমবি এর বেশি)। প্রসেসিং জটিলতার জন্য ৩০০ এমবি এর কম সাইজের ফাইল ব্যবহার করুন।");
-      return;
-    }
-
-    if (file.size > 15 * 1024 * 1024) {
-      if (!confirm("ফাইলটি বেশ বড়। এটি প্রসেস হতে ৫-১০ মিনিট পর্যন্ত সময় নিতে পারে। আপনি কি চালিয়ে যেতে চান?")) {
-        return;
-      }
-    }
-
     const existingSession = sessions.find(s => s.name === getFileNameWithoutExtension(file.name));
     if (existingSession) {
       if (confirm(`"${existingSession.name}" এর জন্য পূর্ববর্তী অনুশীলন সেশন পাওয়া গেছে। আপনি কি সেটি লোড করতে চান?`)) {
@@ -130,59 +121,82 @@ export default function App() {
     }
 
     setIsUploading(true);
-    setUploadProgress("0% - ফাইল আপলোড হচ্ছে...");
+    setUploadError(null);
+    setUploadProgress("0% - আপলোড শুরু হচ্ছে...");
 
     try {
-      // 1. Extract text from file via backend
-      const formData = new FormData();
-      formData.append('file', file);
-
-      setUploadProgress("10% - লেখা বের করা হচ্ছে (বড় ফাইলের জন্য ৫-১০ মিনিট সময় লাগতে পারে)...");
+      const uploadId = `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const CHUNK_SIZE = 1 * 1024 * 1024; // Reduced to 1MB for maximum mobile stability
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       
-      const fetchUrl = `/api/extract-text?_t=${Date.now()}`;
-      console.log(`[MCQ-GENIE] Calling: ${fetchUrl}`);
+      console.log(`[MCQ-GENIE] Starting chunked upload for ${file.name}. Size: ${file.size}, Total chunks: ${totalChunks}`);
 
-      const extractRes = await fetch(fetchUrl, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest'
-        },
-        body: formData
-      });
-      
-      const contentType = extractRes.headers.get("content-type");
-      let extractData;
-
-      if (contentType && contentType.includes("application/json")) {
-        extractData = await extractRes.json();
-      } else {
-        const textError = await extractRes.text();
-        console.error("Non-JSON response received:", textError);
+      // 1. Upload chunks sequentially with retry logic
+      for (let i = 0; i < totalChunks; i++) {
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
         
-        if (textError.includes("<!doctype html>")) {
-          throw new Error("সার্ভারের সাথে সংযোগ বিচ্ছিন্ন হয়েছে বা ফাইলটি অত্যন্ত বড়। অনুগ্রহ করে একবার রিফ্রেশ দিয়ে আবার ছোট ফাইল (১০০ এমবির কম) দিয়ে চেষ্টা করুন।");
+        const uploadProgressValue = Math.round((i / totalChunks) * 40);
+        setUploadProgress(`${uploadProgressValue}% - ফাইল আপলোড হচ্ছে (${i + 1}/${totalChunks})...`);
+
+        let retryCount = 0;
+        const maxRetries = 2;
+        let success = false;
+
+        while (retryCount <= maxRetries && !success) {
+          try {
+            const formData = new FormData();
+            formData.append('chunk', chunk, file.name);
+            formData.append('uploadId', uploadId);
+            formData.append('index', i.toString());
+            formData.append('total', totalChunks.toString());
+
+            const res = await fetch('/api/upload-chunk', {
+              method: 'POST',
+              body: formData
+            });
+
+            if (!res.ok) {
+              const errData = await res.json().catch(() => ({ error: "Server error" }));
+              throw new Error(errData.error || `Chunk ${i} upload failed.`);
+            }
+            success = true;
+          } catch (chunkErr) {
+            retryCount++;
+            if (retryCount > maxRetries) throw chunkErr;
+            console.warn(`[MCQ-GENIE] Retry chunk ${i} (attempt ${retryCount})`);
+            await new Promise(r => setTimeout(r, 1500)); 
+          }
         }
-        
-        const snippet = textError.substring(0, 100);
-        throw new Error(`সার্ভার থেকে অস্পষ্ট রেসপন্স এসেছে (Error ${extractRes.status})। বিস্তারিত: ${snippet}...`);
-      }
-      
-      if (!extractRes.ok) {
-        throw new Error(extractData.error || "ফাইলটি প্রসেস করতে সমস্যা হয়েছে।");
       }
 
-      setUploadProgress("40% - লেখা প্রসেস করা হচ্ছে...");
+      setUploadProgress("40% - ফাইল প্রসেস করা হচ্ছে...");
+      
+      // 2. Finalize and extract text
+      const finalizeRes = await fetch('/api/extract-text-chunked', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uploadId, fileName: file.name, totalChunks })
+      });
+
+      if (!finalizeRes.ok) {
+        const errData = await finalizeRes.json();
+        throw new Error(errData.error || "ফাইল জোড়া লাগাতে সমস্যা হয়েছে।");
+      }
+
+      const extractData = await finalizeRes.json();
       const { content } = extractData;
       
-      if (!content) throw new Error("No content extracted from file");
+      if (!content) throw new Error("ফাইল থেকে কোনো তথ্য পাওয়া যায়নি।");
 
       const cleanedContent = cleanExtractedText(content);
       
-      // Chunking for large files - cap at 4 chunks for mobile memory stability
-      const chunkSize = 8000;
+      // Chunking for analysis - increase capacity for large files significantly
+      const chunkSize = 15000;
       const chunks = [];
-      for (let i = 0; i < cleanedContent.length && chunks.length < 4; i += chunkSize) {
+      // Increased to 80 chunks for better coverage (up to 1.2M characters)
+      for (let i = 0; i < cleanedContent.length && chunks.length < 80; i += chunkSize) {
         chunks.push(cleanedContent.substring(i, i + chunkSize));
       }
 
@@ -190,22 +204,36 @@ export default function App() {
       let finalSummary = "";
       const sessionId = Math.random().toString(36).substring(7);
 
+      let lastError = "";
       for (let i = 0; i < chunks.length; i++) {
-        // Map processing stage (40% to 90%)
         const chunkProgress = Math.round(40 + ((i / chunks.length) * 50));
         setUploadProgress(`${chunkProgress}% - AI দিয়ে বিশ্লেষণ করা হচ্ছে (অংশ ${i + 1}/${chunks.length})...`);
         
-        // 2. Process content with Gemini library
-        const { summary, questions } = await analyzeMaterial(chunks[i]);
-        
-        // Ensure IDs are unique across chunks and globally
-        const processedQuestions = questions.map((q, qIdx) => ({
-          ...q,
-          id: `${sessionId}-q-${i}-${qIdx}-${Math.random().toString(36).substring(2, 7)}`
-        }));
-        
-        allQuestions = [...allQuestions, ...processedQuestions];
-        finalSummary += (summary || "") + "\n";
+        try {
+          const { summary, questions } = await analyzeMaterial(chunks[i]);
+          
+          if (questions && Array.isArray(questions) && questions.length > 0) {
+            const processedQuestions = questions.map((q, qIdx) => ({
+              ...q,
+              id: `${sessionId}-q-${i}-${qIdx}-${Math.random().toString(36).substring(2, 7)}`
+            }));
+            allQuestions = [...allQuestions, ...processedQuestions];
+          }
+          
+          if (summary) {
+            finalSummary += summary + "\n";
+          }
+        } catch (analysisErr: any) {
+          console.error(`[MCQ-GENIE] Chunk ${i} analysis failed:`, analysisErr);
+          lastError = analysisErr.message || String(analysisErr);
+        }
+      }
+
+      if (allQuestions.length === 0) {
+        const errorMsg = lastError 
+          ? `AI প্রসেসিং ব্যর্থ হয়েছে: ${lastError}` 
+          : "ফাইলটি থেকে কোনো MCQ তৈরি করা সম্ভব হয়নি। ফাইলটি পরিষ্কার এবং লেখাগুলো স্পষ্ট কিনা নিশ্চিত করুন।";
+        throw new Error(errorMsg);
       }
 
       setUploadProgress("95% - প্রশ্নগুলো সেভ করা হচ্ছে...");
@@ -213,16 +241,15 @@ export default function App() {
       const sessionData: StudySession = {
         id: sessionId,
         name: getFileNameWithoutExtension(file.name),
-        content: "", // Don't store massive raw text in frontend state to prevent crashes
+        content: "",
         summary: finalSummary.substring(0, 2000) + (finalSummary.length > 2000 ? "..." : ""),
         questions: allQuestions
       };
 
-      // 3. Save session to SQLite via backend
       await fetch('/api/save-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...sessionData, content: cleanedContent.substring(0, 10000) }) // Only save a snippet to the DB
+        body: JSON.stringify({ ...sessionData, content: cleanedContent.substring(0, 10000) })
       });
 
       setSessions([sessionData, ...sessions]);
@@ -230,7 +257,9 @@ export default function App() {
       setView('quiz');
       setIsSidebarOpen(false);
     } catch (err: any) {
-      console.error(err);
+      console.error("[MCQ-GENIE] Upload failed:", err);
+      setUploadError(err.message || "একটি অপ্রত্যাশিত সমস্যা হয়েছে।");
+      // alert persists as fallback
       alert(err.message || "Something went wrong. Please check your connection and configuration.");
     } finally {
       setIsUploading(false);
@@ -550,6 +579,13 @@ export default function App() {
                     <div className="absolute -top-3 left-6 px-2 bg-amber-100 text-[10px] font-black uppercase text-amber-700 rounded-full">বোরড হচ্ছেন? একটি জোকস পড়ুন</div>
                     {joke}
                 </div>
+
+                {uploadError && (
+                  <div className="p-4 bg-red-50 border border-red-200 rounded-2xl text-red-600 text-sm font-bold">
+                    ত্রুটি: {uploadError}
+                    <button onClick={() => setUploadError(null)} className="ml-2 underline">ঠিক আছে</button>
+                  </div>
+                )}
                 
                 <div className="pt-4 flex items-center justify-center gap-2 text-slate-400">
                   <div className="w-2 h-2 bg-blue-600 rounded-full animate-pulse" />
@@ -719,21 +755,61 @@ export default function App() {
                        </div>
                      </div>
                      
-                     <div className="relative max-w-md w-full">
-                       <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400 pointer-events-none" />
-                       <input 
-                         type="text"
-                         placeholder="সেশন খুঁজুন..."
-                         value={searchHistory}
-                         onChange={(e) => setSearchHistory(e.target.value)}
-                         className="w-full bg-white border border-slate-200 py-3 pl-12 pr-4 rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-medium text-slate-900"
-                       />
-                     </div>
+                      <div className="flex flex-wrap items-center gap-3 w-full lg:w-auto">
+                        <select 
+                          value={filterTopic}
+                          onChange={(e) => setFilterTopic(e.target.value)}
+                          className="bg-white border border-slate-200 px-4 py-2.5 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 font-bold text-slate-700 text-sm appearance-none cursor-pointer shadow-sm"
+                        >
+                          <option value="all">সব বিষয়</option>
+                          <option value="science">বিজ্ঞান</option>
+                          <option value="arts">মানবিক</option>
+                        </select>
+                        
+                        <select 
+                          value={sortOrder}
+                          onChange={(e) => setSortOrder(e.target.value as any)}
+                          className="bg-white border border-slate-200 px-4 py-2.5 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 font-bold text-slate-700 text-sm appearance-none cursor-pointer shadow-sm"
+                        >
+                          <option value="newest">নতুনগুলো আগে</option>
+                          <option value="oldest">পুরানো গুলো আগে</option>
+                          <option value="az">A-Z</option>
+                        </select>
+
+                        <div className="relative flex-1 md:max-w-xs">
+                          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+                          <input 
+                            type="text"
+                            placeholder="সেশন খুঁজুন..."
+                            value={searchHistory}
+                            onChange={(e) => setSearchHistory(e.target.value)}
+                            className="w-full bg-white border border-slate-200 py-3 pl-11 pr-4 rounded-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all font-bold text-sm text-slate-900 shadow-sm"
+                          />
+                        </div>
+                      </div>
                    </div>
 
                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                      {sessions
-                       .filter(s => s.name.toLowerCase().includes(searchHistory.toLowerCase()) || (s.summary && s.summary.toLowerCase().includes(searchHistory.toLowerCase())))
+                       .filter(s => {
+                          const matchesSearch = s.name.toLowerCase().includes(searchHistory.toLowerCase()) || 
+                                              (s.summary && s.summary.toLowerCase().includes(searchHistory.toLowerCase()));
+                          if (!matchesSearch) return false;
+                          if (filterTopic === 'all') return true;
+                          const name = s.name.toLowerCase();
+                          const scienceKeywords = ['বিজ্ঞান', 'physic', 'chemist', 'biology', 'math', 'জীববিজ্ঞান', 'রসায়ন', 'পদার্থ', 'গণিত'];
+                          const artsKeywords = ['ইতিহাস', 'বাংলা', 'পৌরনীতি', 'ভূগোল', 'sociology', 'history', 'bangla', 'civics'];
+                          
+                          if (filterTopic === 'science') return scienceKeywords.some(key => name.includes(key.toLowerCase()));
+                          if (filterTopic === 'arts') return artsKeywords.some(key => name.includes(key.toLowerCase()));
+                          return true;
+                        })
+                        .sort((a, b) => {
+                          if (sortOrder === 'newest') return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+                          if (sortOrder === 'oldest') return new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime();
+                          if (sortOrder === 'az') return a.name.localeCompare(b.name);
+                          return 0;
+                        })
                        .map((session) => (
                        <motion.div 
                          layout

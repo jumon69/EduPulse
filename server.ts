@@ -12,7 +12,6 @@ import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import Tesseract from 'tesseract.js';
-import * as pdfModule from 'pdf-parse';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const db = new Database('hsc_mcq_genie.db');
@@ -20,7 +19,8 @@ const db = new Database('hsc_mcq_genie.db');
 // Improved Python interaction using spawn for large data
 async function runPythonLogic(text: string): Promise<any> {
   return new Promise((resolve) => {
-    const pyProcess = spawn('python3', ['processor.py']);
+    // Calling main.py as requested for stronger architecture
+    const pyProcess = spawn('python3', ['main.py']);
     let outputData = '';
     let errorData = '';
 
@@ -109,78 +109,180 @@ async function startServer() {
       }
     }),
     limits: { 
-      fileSize: 400 * 1024 * 1024,
-      fieldSize: 400 * 1024 * 1024
+      fileSize: 1024 * 1024 * 1024, // 1GB limit for combined file
+      fieldSize: 1024 * 1024 * 1024
     }
   });
 
-  // Direct API Routes
-  app.post("/api/extract-text", upload.single("file"), async (req: any, res: any) => {
-    console.log(`[API-LOG] Extract text request for: ${req.file?.originalname}`);
+  // Chunked Upload Endpoint
+  app.post("/api/upload-chunk", upload.single("chunk"), async (req: any, res: any) => {
+    const { uploadId, index, total } = req.body;
     const fs = await import("fs/promises");
-    const filePath = req.file?.path;
+    const path = await import("path");
+    
+    if (!uploadId || index === undefined || !req.file) {
+      return res.status(400).json({ error: "Missing chunk data" });
+    }
 
+    const chunkDir = path.join("/tmp", "chunks", uploadId);
     try {
-      if (!req.file) {
-        return res.status(400).json({ error: "ফাইল পাওয়া যায়নি বা অবৈধ ফরম্যাট।" });
+      await fs.mkdir(chunkDir, { recursive: true });
+      const chunkPath = path.join(chunkDir, index.toString());
+      await fs.rename(req.file.path, chunkPath);
+      res.json({ success: true, index });
+    } catch (e: any) {
+      console.error("Chunk upload error:", e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Reassemble and Extract Text
+  app.post("/api/extract-text-chunked", async (req: any, res: any) => {
+    const { uploadId, fileName, totalChunks } = req.body;
+    const fs = await import("fs/promises");
+    const path = await import("path");
+    
+    console.log(`[API-LOG] Reassembling ${fileName} (${totalChunks} chunks) for uploadId: ${uploadId}`);
+    
+    if (!uploadId || !totalChunks) {
+      return res.status(400).json({ error: "Missing upload identity" });
+    }
+
+    const chunkDir = path.join("/tmp", "chunks", uploadId);
+    const finalPath = path.join("/tmp", `mcq-final-${Date.now()}-${fileName.replace(/[^a-z0-9.]/gi, "_")}`);
+    
+    try {
+      // Reassemble - Use appendFile to combine chunks
+      for (let i = 0; i < totalChunks; i++) {
+        const chunkPath = path.join(chunkDir, i.toString());
+        try {
+          const chunkData = await fs.readFile(chunkPath);
+          await fs.appendFile(finalPath, chunkData);
+          console.log(`[API-LOG] Appended chunk ${i} for ${uploadId}`);
+        } catch (readErr) {
+          console.error(`Error reading chunk ${i} from ${chunkPath}:`, readErr);
+          throw new Error(`চাক্স ${i} পাওয়া যায়নি বা পড়া যাচ্ছে না।`);
+        }
       }
 
+      const fileStats = await fs.stat(finalPath);
+      console.log(`[API-LOG] Reassembly complete. Final size: ${fileStats.size} bytes`);
+
+      // Improved mimetype detection for images and docs
+      let mimetype = "text/plain";
+      const ext = fileName.toLowerCase();
+      if (ext.endsWith(".pdf")) mimetype = "application/pdf";
+      else if (ext.endsWith(".jpg") || ext.endsWith(".jpeg")) mimetype = "image/jpeg";
+      else if (ext.endsWith(".png")) mimetype = "image/png";
+      else if (ext.endsWith(".webp")) mimetype = "image/webp";
+      else if (ext.endsWith(".bmp")) mimetype = "image/bmp";
+      
+      await processFile(finalPath, fileName, mimetype, res);
+      
+    } catch (e: any) {
+      console.error("Reassembly error:", e);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "ফাইল প্রসেসিং ব্যর্থ হয়েছে: " + e.message });
+      }
+    } finally {
+      // ALWAYS cleanup
+      try { await fs.rm(chunkDir, { recursive: true, force: true }).catch(() => {}); } catch (e) {}
+      try { await fs.unlink(finalPath).catch(() => {}); } catch (e) {}
+    }
+  });
+
+  async function processFile(filePath: string, originalName: string, mimetype: string, res: any) {
+    const fs = await import("fs/promises");
+    console.log(`[API-LOG] Processing file: ${originalName} (${mimetype})`);
+    try {
       let content = "";
-      const mimetype = req.file.mimetype;
-      const isPdf = mimetype === "application/pdf" || req.file.originalname.toLowerCase().endsWith(".pdf");
+      const isPdf = mimetype === "application/pdf" || originalName.toLowerCase().endsWith(".pdf");
+      const isImage = mimetype.startsWith("image/") || /\.(jpg|jpeg|png|webp|bmp)$/i.test(originalName);
       
       if (isPdf) {
         const dataBuffer = await fs.readFile(filePath);
         let extractedText = "";
 
         try {
-          if (pdfModule && (pdfModule as any).PDFParse) {
-            const PDFParseClass = (pdfModule as any).PDFParse;
-            const parser = new PDFParseClass({ data: dataBuffer });
-            const result = await parser.getText();
-            extractedText = result.text || "";
-            await parser.destroy();
-          } else {
-            const require = createRequire(import.meta.url);
-            const pdfReq = require("pdf-parse");
-            const data = await pdfReq(dataBuffer);
-            extractedText = data.text || "";
+          const require = createRequire(import.meta.url);
+          const pdfReq = require("pdf-parse");
+          const pdf = typeof pdfReq === 'function' ? pdfReq : pdfReq.default;
+          
+          if (typeof pdf !== 'function') {
+            console.error("pdf-parse is not a function. pdfReq:", pdfReq);
+            throw new Error("পিডিএফ প্রসেসিং সার্ভার এরর।");
           }
+          
+          const data = await pdf(dataBuffer).catch((e: any) => {
+            console.error("pdf-parse internal error:", e);
+            throw e;
+          });
+          extractedText = data.text || "";
+          console.log(`[API-LOG] PDF text extracted. Length: ${extractedText.length}`);
         } catch (pdfErr: any) {
-          console.error("PDF Parse error:", pdfErr);
-          throw new Error("পিডিএফ ফাইলটি পড়া যাচ্ছে না।");
+          console.error("PDF Parsing failed:", pdfErr);
+          throw new Error("পিডিএফ ফাইলটি পড়া যাচ্ছে না। এটি এনক্রিপ্টেড বা পাসওয়ার্ড প্রটেক্টেড কি না চেক করুন।");
         }
         content = extractedText;
       } 
-      else if (mimetype.startsWith("image/")) {
-        const dataBuffer = await fs.readFile(filePath);
-        const { data: { text } } = await Tesseract.recognize(dataBuffer, "ben+eng");
-        content = text;
+      else if (isImage) {
+        console.log(`[API-LOG] Starting OCR for image: ${originalName}`);
+        try {
+          const { data: { text } } = await Tesseract.recognize(filePath, 'eng+ben', {
+            logger: m => console.log(`[OCR-PROGRESS] ${m.status}: ${Math.round(m.progress * 100)}%`)
+          });
+          content = text;
+          console.log(`[API-LOG] OCR complete. Length: ${content.length}`);
+        } catch (ocrErr: any) {
+          console.error("OCR failed:", ocrErr);
+          throw new Error("ছবি থেকে লেখা বের করা সম্ভব হয়নি। পরিষ্কার ছবি দিয়ে আবার চেষ্টা করুন।");
+        }
       }
       else {
         const dataBuffer = await fs.readFile(filePath);
         content = dataBuffer.toString("utf-8");
+        console.log(`[API-LOG] Text file read. Length: ${content.length}`);
       }
       
       if (!content || !content.trim()) {
-        return res.status(422).json({ error: "ফাইল থেকে কোনো লেখা পাওয়া যায়নি।" });
+        console.warn(`[API-LOG] Empty content extracted from ${originalName}`);
+        return res.status(422).json({ error: "ফাইল থেকে কোনো লেখা পাওয়া যায়নি। ফাইলটি ফাঁকা কি না চেক করে দেখুন।" });
       }
 
+      console.log(`[API-LOG] Running Python logic on content...`);
       const pyResult = await runPythonLogic(content);
+      console.log(`[API-LOG] Python processing complete. Status: ${pyResult.error ? 'Error' : 'Success'}`);
+
+      if (pyResult.error) {
+         console.warn(`[API-LOG] Python Error: ${pyResult.error}`);
+      }
 
       res.json({ 
         content: pyResult.processed_text || content, 
         stats: { 
-          word_count: pyResult.word_count, 
-          language: pyResult.language 
+          word_count: pyResult.word_count || 0, 
+          language: pyResult.language || "unknown"
         } 
       });
     } catch (error: any) {
-      console.error("API Error:", error);
-      res.status(500).json({ error: "সার্ভারে সমস্যা হয়েছে: " + (error.message || "Unknown error") });
+      console.error(`[API-LOG] processFile Error:`, error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error.message });
+      }
+    }
+  }
+
+  // Direct API Routes
+  app.post("/api/extract-text", upload.single("file"), async (req: any, res: any) => {
+    console.log(`[API-LOG] Extract text request for: ${req.file?.originalname}`);
+    if (!req.file) return res.status(400).json({ error: "ফাইল পাওয়া যায়নি।" });
+    
+    try {
+      await processFile(req.file.path, req.file.originalname, req.file.mimetype, res);
     } finally {
-      if (filePath) {
-        try { await fs.unlink(filePath).catch(() => {}); } catch (e) {}
+      if (req.file.path) {
+        const fs = await import("fs/promises");
+        try { await fs.unlink(req.file.path).catch(() => {}); } catch (e) {}
       }
     }
   });
