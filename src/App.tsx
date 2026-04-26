@@ -15,6 +15,14 @@ import {
   Search
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { Camera as CameraCap, CameraResultType, CameraSource } from '@capacitor/camera';
+import { Preferences } from '@capacitor/preferences';
+
+// Stability Constants for Mobile
+const MAX_CONTENT_LENGTH = 100000;
+const MAX_SUMMARY_LENGTH = 1500;
+const ANALYSIS_CHUNK_SIZE = 15000;
+const MAX_ANALYSIS_CHUNKS = 10;
 import { analyzeMaterial } from './ai/gemini';
 import { getFileNameWithoutExtension, cleanExtractedText } from './lib/pdfUtils';
 import { Question, StudySession, Stats } from './types';
@@ -95,15 +103,41 @@ export default function App() {
   }, []);
 
   const takePhoto = async () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*';
-    input.capture = 'environment';
-    input.onchange = (e: any) => {
-      const file = e.target.files[0];
-      if (file) handleFileUploadInternal(file);
-    };
-    input.click();
+    try {
+      const image = await CameraCap.getPhoto({
+        quality: 90,
+        allowEditing: false,
+        resultType: CameraResultType.Base64,
+        source: CameraSource.Camera,
+        promptLabelHeader: 'ছবি তুলুন',
+        promptLabelPhoto: 'গ্যালারি থেকে নিন',
+        promptLabelPicture: 'ছবি তুলুন'
+      });
+
+      if (image.base64String) {
+        // Convert base64 to File object
+        const byteCharacters = atob(image.base64String);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+          byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        const blob = new Blob([byteArray], { type: `image/${image.format}` });
+        const file = new File([blob], `capture-${Date.now()}.${image.format}`, { type: `image/${image.format}` });
+        handleFileUploadInternal(file);
+      }
+    } catch (err) {
+      console.warn("Camera cancelled or failed", err);
+      // Fallback to traditional input if camera plugin fails
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.onchange = (e: any) => {
+        const file = e.target.files[0];
+        if (file) handleFileUploadInternal(file);
+      };
+      input.click();
+    }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -203,12 +237,10 @@ export default function App() {
 
       const cleanedContent = cleanExtractedText(content);
       
-      // Chunking for analysis - increase capacity for large files significantly
-      const chunkSize = 30000;
       const chunks = [];
-      // Max 20 chunks to avoid excessive mobile network load
-      for (let i = 0; i < cleanedContent.length && chunks.length < 20; i += chunkSize) {
-        chunks.push(cleanedContent.substring(i, i + chunkSize));
+      const contentForChunks = cleanedContent.substring(0, MAX_CONTENT_LENGTH);
+      for (let i = 0; i < contentForChunks.length && chunks.length < MAX_ANALYSIS_CHUNKS; i += ANALYSIS_CHUNK_SIZE) {
+        chunks.push(contentForChunks.substring(i, i + ANALYSIS_CHUNK_SIZE));
       }
 
       let allQuestions: any[] = [];
@@ -261,14 +293,14 @@ export default function App() {
         id: sessionId,
         name: getFileNameWithoutExtension(file.name),
         content: "",
-        summary: finalSummary.substring(0, 2000) + (finalSummary.length > 2000 ? "..." : ""),
-        questions: allQuestions
+        summary: finalSummary.substring(0, MAX_SUMMARY_LENGTH) + (finalSummary.length > MAX_SUMMARY_LENGTH ? "..." : ""),
+        questions: allQuestions.slice(0, 50) // Limit to 50 questions for mobile performance
       };
 
       await fetch('/api/save-session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...sessionData, content: cleanedContent.substring(0, 500000) })
+        body: JSON.stringify({ ...sessionData, content: cleanedContent.substring(0, MAX_CONTENT_LENGTH) })
       });
 
       setSessions([sessionData, ...sessions]);
@@ -276,16 +308,22 @@ export default function App() {
       setView('quiz');
       setIsSidebarOpen(false);
     } catch (err: any) {
-      console.error("[MCQ-GENIE] Upload failed:", err);
+      console.error("[MCQ-GENIE] CRITICAL UPLOAD ERROR:", err);
       let errorMsg = err.message || "একটি অপ্রত্যাশিত সমস্যা হয়েছে।";
       
-      if (errorMsg.includes("Failed to fetch") || errorMsg.includes("load failed")) {
-        errorMsg = "সার্ভারের সাথে যোগাযোগ বিচ্ছিন্ন হয়েছে। আপনার ইন্টারনেট কানেকশন চেক করে আবার চেষ্টা করুন। (Network Error)";
+      // Handle specific network errors
+      if (err.name === 'AbortError' || errorMsg.includes("Failed to fetch") || errorMsg.includes("load failed")) {
+        errorMsg = "সার্ভারের সাথে যোগাযোগ বিচ্ছিন্ন হয়েছে। ফাইলটি খুব বড় হতে পারে বা ইন্টারনেট স্লো। (Network Error)";
       }
       
       setUploadError(errorMsg);
-      // alert persists as fallback for critical issues
-      if (errorMsg.length < 100) alert(errorMsg);
+      
+      // In mobile, toast is better but alert is reliable
+      if (errorMsg.length < 200) {
+        try {
+          alert(`Error: ${errorMsg}`);
+        } catch (e) {}
+      }
     } finally {
       setIsUploading(false);
       setUploadProgress("");

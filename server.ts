@@ -94,7 +94,8 @@ async function startServer() {
 
   // Global Request Logger - BEFORE EVERYTHING ELSE
   app.use((req, res, next) => {
-    console.log(`[GLOBAL-LOG] ${req.method} ${req.originalUrl} - IP: ${req.ip}`);
+    const memory = process.memoryUsage();
+    console.log(`[GLOBAL-LOG] ${req.method} ${req.originalUrl} - RSS: ${Math.round(memory.rss / 1024 / 1024)}MB`);
     next();
   });
 
